@@ -1,4 +1,10 @@
 language: go
-script: make test
-go:
-  - 1.6
+
+services:
+  - docker
+
+script: 
+  - make test
+
+after_success:
+  - ./build.sh travis-docker-push

@@ -1,18 +1,62 @@
 #!/bin/bash
 set -e
 
-VERSION="1.3.0"
+cd $(dirname "${BASH_SOURCE[0]}")
+OD="$(pwd)"
+
+VERSION=1.13.0
 PROTECTED_MODE="no"
 
 # Hardcode some values to the core package
-LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/core.Version=${VERSION}"
+LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/pkg/core.Version=${VERSION}"
 if [ -d ".git" ]; then
-	LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/core.GitSHA=$(git rev-parse --short HEAD)"
+	LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/pkg/core.GitSHA=$(git rev-parse --short HEAD)"
 fi
-LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/core.BuildTime=$(date +%FT%T%z)"
+LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/pkg/core.BuildTime=$(date +%FT%T%z)"
 if [ "$PROTECTED_MODE" == "no" ]; then
-	LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/core.ProtectedMode=no"
+	LDFLAGS="$LDFLAGS -X github.com/tidwall/tile38/pkg/core.ProtectedMode=no"
 fi
+
+if [ "$1" == "update-version" ]; then
+	# update the versions in the README.md
+	sed -i '' "s/version-[0-9]*\.[0-9]*\.[0-9]*/version-$VERSION/g" README.md
+	exit
+fi
+
+if [ "$1" == "travis-docker-push" ]; then
+    # GIT_VERSION - always the last verison number, like 1.12.1.
+    export GIT_VERSION=$(git describe --tags --abbrev=0)  
+    # GIT_COMMIT_SHORT - the short git commit number, like a718ef0.
+    export GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+    # DOCKER_REPO - the base repository name to push the docker build to.
+    export DOCKER_REPO=$DOCKER_USER/tile38
+
+    if [ "$TRAVIS_PULL_REQUEST" != "false" ]; then 
+        # never push from a pull request
+        echo "Not pushing, on a PR or not running in Travis CI"
+    elif [ "$TRAVIS_BRANCH" != "master" ]; then
+        # only the master branch will work
+        echo "Not pushing, not on master"
+    else
+        push(){
+            docker tag $DOCKER_REPO:$GIT_COMMIT_SHORT $DOCKER_REPO:$1
+            docker push $DOCKER_REPO:$1
+            echo "Pushed $DOCKER_REPO:$1"
+        }
+        # docker login
+        echo $DOCKER_PASSWORD | docker login -u $DOCKER_LOGIN --password-stdin
+        # build the docker image
+        docker build -f Dockerfile -t $DOCKER_REPO:$GIT_COMMIT_SHORT .
+        if [ "$(curl -s https://hub.docker.com/v2/repositories/$DOCKER_REPO/tags/$GIT_VERSION/ | grep "$GIT_VERSION" | grep "repository")" == "" ]; then
+            # push the newest tag
+            push "$GIT_VERSION"
+            push "latest"
+        fi
+        push "edge"
+    fi
+    exit
+fi
+
 
 # Check go install
 if [ "$(which go)" == "" ]; then
@@ -58,17 +102,12 @@ if [ "$GOVERS" != "devel" ]; then
 		return
 	}
 	GOVERS="${GOVERS:2}"
-	EQRES=$(vercomp "$GOVERS" "1.5")  
+	EQRES=$(vercomp "$GOVERS" "1.7")  
 	if [ "$EQRES" == "-1" ]; then
-		  echo "error: Go '1.5' or greater is required and '$GOVERS' is currently installed. Please upgrade Go at https://golang.org/dl to continue."	
+		  echo "error: Go '1.7' or greater is required and '$GOVERS' is currently installed. Please upgrade Go at https://golang.org/dl to continue."	
 		  exit 1
 	fi
 fi
-
-export GO15VENDOREXPERIMENT=1
-
-cd $(dirname "${BASH_SOURCE[0]}")
-OD="$(pwd)"
 
 package(){
 	echo Packaging $1 Binary
@@ -78,11 +117,15 @@ package(){
 	if [ "$2" == "windows" ]; then
 		mv tile38-server packages/$bdir/tile38-server.exe
 		mv tile38-cli packages/$bdir/tile38-cli.exe
+		mv tile38-benchmark packages/$bdir/tile38-benchmark.exe
 	else
 		mv tile38-server packages/$bdir
 		mv tile38-cli packages/$bdir
+		mv tile38-benchmark packages/$bdir
 	fi
 	cp README.md packages/$bdir
+	cp CHANGELOG.md packages/$bdir
+	cp LICENSE packages/$bdir
 	cd packages
 	if [ "$2" == "linux" ]; then
 		tar -zcf $bdir.tar.gz $bdir
@@ -102,7 +145,6 @@ if [ "$1" == "package" ]; then
 	exit
 fi
 
-
 # temp directory for storing isolated environment.
 TMP="$(mktemp -d -t tile38.XXXX)"
 function rmtemp {
@@ -110,23 +152,22 @@ function rmtemp {
 }
 trap rmtemp EXIT
 
-if [ "$NOCOPY" != "1" ]; then
-	# copy all files to an isloated directory.
-	WD="$TMP/src/github.com/tidwall/tile38"
-	export GOPATH="$TMP"
-	for file in `find . -type f`; do
-		# TODO: use .gitignore to ignore, or possibly just use git to determine the file list.
-		if [[ "$file" != "." && "$file" != ./.git* && "$file" != ./data* && "$file" != ./tile38-* ]]; then
-			mkdir -p "$WD/$(dirname "${file}")"
-			cp -P "$file" "$WD/$(dirname "${file}")"
-		fi
-	done
-	cd $WD
+if [ "$NOLINK" != "1" ]; then
+    # symlink root to isolated directory
+	mkdir -p "$TMP/go/src/github.com/tidwall"
+    ln -s $OD "$TMP/go/src/github.com/tidwall/tile38"
+    export GOPATH="$TMP/go"
+	cd "$TMP/go/src/github.com/tidwall/tile38"
 fi
 
+# generate the core package
+pkg/core/gen.sh
+
 # build and store objects into original directory.
-go build -ldflags "$LDFLAGS" -o "$OD/tile38-server" cmd/tile38-server/*.go
-go build -ldflags "$LDFLAGS" -o "$OD/tile38-cli" cmd/tile38-cli/*.go
+CGO_ENABLED=0 go build -ldflags "$LDFLAGS -extldflags '-static'" -o "$OD/tile38-server" cmd/tile38-server/*.go
+CGO_ENABLED=0 go build -ldflags "$LDFLAGS -extldflags '-static'" -o "$OD/tile38-cli" cmd/tile38-cli/*.go
+CGO_ENABLED=0 go build -ldflags "$LDFLAGS -extldflags '-static'" -o "$OD/tile38-benchmark" cmd/tile38-benchmark/*.go
+CGO_ENABLED=0 go build -ldflags "$LDFLAGS -extldflags '-static'" -o "$OD/tile38-luamemtest" cmd/tile38-luamemtest/*.go
 
 # test if requested
 if [ "$1" == "test" ]; then
@@ -136,7 +177,8 @@ if [ "$1" == "test" ]; then
 		kill $PID &
 	}
 	trap testend EXIT
-	go test $(go list ./... | grep -v /vendor/)
+	cd tests && go test && cd ..
+	go test $(go list ./... | grep -v /vendor/ | grep -v /tests)
 fi
 
 # cover if requested

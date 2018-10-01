@@ -5,15 +5,24 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 
-	"github.com/tidwall/tile38/controller"
-	"github.com/tidwall/tile38/controller/log"
-	"github.com/tidwall/tile38/core"
+	"golang.org/x/net/context"
+
+	"google.golang.org/grpc"
+
+	"github.com/tidwall/tile38/pkg/controller"
+	"github.com/tidwall/tile38/pkg/core"
+	"github.com/tidwall/tile38/pkg/hservice"
+	"github.com/tidwall/tile38/pkg/log"
 )
 
 var (
@@ -24,18 +33,66 @@ var (
 	veryVerbose bool
 	devMode     bool
 	quiet       bool
+	pidfile     string
 )
 
-// Fire up a webhook test server by using the --webhook-consumer-port
+// TODO: Set to false in 2.*
+var httpTransport bool = true
+
+// Fire up a webhook test server by using the --webhook-http-consumer-port
 // for example
-//   $ ./tile38-server --webhook-consumer-port 9999
+//   $ ./tile38-server --webhook-http-consumer-port 9999
 //
 // The create hooks like such...
 //   SETHOOK myhook http://localhost:9999/myhook NEARBY mykey FENCE POINT 33.5 -115.5 1000
 
+type hserver struct{}
+
+func (s *hserver) Send(ctx context.Context, in *hservice.MessageRequest) (*hservice.MessageReply, error) {
+	return &hservice.MessageReply{true}, nil
+}
+
 func main() {
-	if len(os.Args) == 3 && os.Args[1] == "--webhook-consumer-port" {
-		log.Default = log.New(os.Stderr, &log.Config{})
+	gitsha := " (" + core.GitSHA + ")"
+	if gitsha == " (0000000)" {
+		gitsha = ""
+	}
+	versionLine := `tile38-server version: ` + core.Version + gitsha
+
+	output := os.Stderr
+	flag.Usage = func() {
+		fmt.Fprintf(output,
+			versionLine+`
+
+Usage: tile38-server [-p port]
+
+Basic Options:
+  -h hostname : listening host
+  -p port     : listening port (default: 9851)
+  -d path     : data directory (default: data)
+  -q          : no logging. totally silent output
+  -v          : enable verbose logging
+  -vv         : enable very verbose logging
+
+Advanced Options: 
+  --pidfile path          : file that contains the pid
+  --appendonly yes/no     : AOF persistence (default: yes)
+  --appendfilename path   : AOF path (default: data/appendonly.aof)
+  --queuefilename path    : Event queue path (default:data/queue.db)
+  --http-transport yes/no : HTTP transport (default: yes)
+  --protected-mode yes/no : protected mode (default: yes)
+
+Developer Options:
+  --dev                             : enable developer mode
+  --webhook-http-consumer-port port : Start a test HTTP webhook server
+  --webhook-grpc-consumer-port port : Start a test GRPC webhook server
+
+`,
+		)
+	}
+
+	if len(os.Args) == 3 && os.Args[1] == "--webhook-http-consumer-port" {
+		log.SetOutput(os.Stderr)
 		port, err := strconv.ParseUint(os.Args[2], 10, 16)
 		if err != nil {
 			log.Fatal(err)
@@ -43,8 +100,7 @@ func main() {
 		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			data, err := ioutil.ReadAll(r.Body)
 			if err != nil {
-				log.Error(err)
-				return
+				log.Fatal(err)
 			}
 			log.HTTPf("http: %s : %s", r.URL.Path, string(data))
 		})
@@ -55,10 +111,37 @@ func main() {
 		return
 	}
 
+	if len(os.Args) == 3 && os.Args[1] == "--webhook-grpc-consumer-port" {
+		log.SetOutput(os.Stderr)
+		port, err := strconv.ParseUint(os.Args[2], 10, 16)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			log.Fatal(err)
+		}
+		s := grpc.NewServer()
+		hservice.RegisterHookServiceServer(s, &hserver{})
+		log.Infof("webhook server grpc://localhost:%d/", port)
+		if err := s.Serve(lis); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	// parse non standard args.
 	nargs := []string{os.Args[0]}
 	for i := 1; i < len(os.Args); i++ {
 		switch os.Args[i] {
+		case "--help":
+			output = os.Stdout
+			flag.Usage()
+			return
+		case "--version":
+			fmt.Fprintf(os.Stdout, "%s\n", versionLine)
+			return
 		case "--protected-mode", "-protected-mode":
 			i++
 			if i < len(os.Args) {
@@ -75,26 +158,74 @@ func main() {
 		case "--dev", "-dev":
 			devMode = true
 			continue
+		case "--appendonly", "-appendonly":
+			i++
+			if i < len(os.Args) {
+				switch strings.ToLower(os.Args[i]) {
+				case "no":
+					core.AppendOnly = "no"
+				case "yes":
+					core.AppendOnly = "yes"
+				}
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "appendonly must be 'yes' or 'no'\n")
+			os.Exit(1)
+		case "--appendfilename", "-appendfilename":
+			i++
+			if i == len(os.Args) || os.Args[i] == "" {
+				fmt.Fprintf(os.Stderr, "appendfilename must have a value\n")
+				os.Exit(1)
+			}
+			core.AppendFileName = os.Args[i]
+		case "--queuefilename", "-queuefilename":
+			i++
+			if i == len(os.Args) || os.Args[i] == "" {
+				fmt.Fprintf(os.Stderr, "queuefilename must have a value\n")
+				os.Exit(1)
+			}
+			core.QueueFileName = os.Args[i]
+		case "--http-transport", "-http-transport":
+			i++
+			if i < len(os.Args) {
+				switch strings.ToLower(os.Args[i]) {
+				case "1", "true", "yes":
+					httpTransport = true
+				case "0", "false", "no":
+					httpTransport = false
+				}
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "http-transport must be 'yes' or 'no'\n")
+			os.Exit(1)
 		}
 		nargs = append(nargs, os.Args[i])
 	}
 	os.Args = nargs
 
 	flag.IntVar(&port, "p", 9851, "The listening port.")
+	flag.StringVar(&pidfile, "pidfile", "", "A file that contains the pid")
 	flag.StringVar(&host, "h", "", "The listening host.")
 	flag.StringVar(&dir, "d", "data", "The data directory.")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose logging.")
 	flag.BoolVar(&quiet, "q", false, "Quiet logging. Totally silent.")
 	flag.BoolVar(&veryVerbose, "vv", false, "Enable very verbose logging.")
 	flag.Parse()
+
 	var logw io.Writer = os.Stderr
 	if quiet {
 		logw = ioutil.Discard
 	}
-	log.Default = log.New(logw, &log.Config{
-		HideDebug: !veryVerbose,
-		HideWarn:  !(veryVerbose || verbose),
-	})
+	log.SetOutput(logw)
+	if quiet {
+		log.Level = 0
+	} else if veryVerbose {
+		log.Level = 3
+	} else if verbose {
+		log.Level = 2
+	} else {
+		log.Level = 1
+	}
 	core.DevMode = devMode
 	core.ShowDebugMessages = veryVerbose
 
@@ -102,27 +233,70 @@ func main() {
 	if host != "" {
 		hostd = "Addr: " + host + ", "
 	}
-	gitsha := " (" + core.GitSHA + ")"
-	if gitsha == " (0000000)" {
-		gitsha = ""
+	var pidferr error
+
+	var cleanedup bool
+	var cleanupMu sync.Mutex
+	cleanup := func() {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		if cleanedup {
+			return
+		}
+		// cleanup code
+		if pidfile != "" {
+			os.Remove(pidfile)
+		}
+		cleanedup = true
 	}
+	defer cleanup()
+
+	if pidfile != "" {
+		pidferr := ioutil.WriteFile(pidfile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0666)
+		if pidferr == nil {
+		}
+	}
+
+	c := make(chan os.Signal, 1)
+
+	signal.Notify(c, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		s := <-c
+		log.Warnf("signal: %v", s)
+		if pidfile != "" {
+			cleanup()
+		}
+		switch {
+		default:
+			os.Exit(-1)
+		case s == syscall.SIGHUP:
+			os.Exit(1)
+		case s == syscall.SIGINT:
+			os.Exit(2)
+		case s == syscall.SIGQUIT:
+			os.Exit(3)
+		case s == syscall.SIGTERM:
+			os.Exit(0xf)
+		}
+	}()
 
 	//  _____ _ _     ___ ___
 	// |_   _|_| |___|_  | . |
 	//   | | | | | -_|_  | . |
 	//   |_| |_|_|___|___|___|
-
 	fmt.Fprintf(logw, `
    _______ _______
   |       |       |
   |____   |   _   |   Tile38 %s%s %d bit (%s/%s)
   |       |       |   %sPort: %d, PID: %d
-  |____   |   _   |
+  |____   |   _   | 
   |       |       |   tile38.com
-  |_______|_______|
+  |_______|_______| 
 `+"\n", core.Version, gitsha, strconv.IntSize, runtime.GOARCH, runtime.GOOS, hostd, port, os.Getpid())
-
-	if err := controller.ListenAndServe(host, port, dir); err != nil {
+	if pidferr != nil {
+		log.Warnf("pidfile: %v", pidferr)
+	}
+	if err := controller.ListenAndServe(host, port, dir, httpTransport); err != nil {
 		log.Fatal(err)
 	}
 }
